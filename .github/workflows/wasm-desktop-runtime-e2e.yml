@@ -98,7 +98,7 @@ jobs:
           test "$(sha256sum fixtures/wasmx-a.wasm | cut -d' ' -f1)" != "$(sha256sum fixtures/wasmx-b.wasm | cut -d' ' -f1)"
           test "$(sha256sum fixtures/ll-a.wasm | cut -d' ' -f1)" != "$(sha256sum fixtures/ll-b.wasm | cut -d' ' -f1)"
 
-      - name: Start both daemons concurrently on canonical unique ports
+      - name: Exercise live isolation, immutable deploys, and unique ports
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/wasmx-home" "$RUNNER_TEMP/ll-home"
@@ -182,8 +182,51 @@ jobs:
           code="$(deploy http://127.0.0.1:8763 "$LL_TOKEN" test-tenant stable-generation "$LL_B" "$RUNNER_TEMP/ll-conflict.json")"
           test "$code" -ge 400
 
-          curl --fail --silent http://127.0.0.1:8766/healthz | grep -qx ok
-          curl --fail --silent http://127.0.0.1:8763/healthz | grep -qx ok
+          # These minimal guests intentionally return no JSON payload. Repeated
+          # invocation failures must be contained to fresh per-invocation
+          # isolation and must not poison the resident daemon.
+          for invocation in 1 2; do
+            code="$(curl --silent --show-error --output "$RUNNER_TEMP/wasmx-invoke-$invocation.json" --write-out '%{http_code}' \
+              -H "Authorization: Bearer $WASMX_TOKEN" \
+              -H 'Content-Type: application/json' \
+              --data "{\"invocation_id\":\"wasmx-failure-$invocation\",\"tenant_id\":\"test-tenant\",\"deployment_id\":\"stable-generation\",\"payload_json\":{},\"timeout_ms\":2000}" \
+              http://127.0.0.1:8766/v1/invoke)"
+            test "$code" = 502
+            curl --fail --silent http://127.0.0.1:8766/healthz | grep -qx ok
+
+            test "$(curl --silent --show-error --output "$RUNNER_TEMP/ll-invoke-$invocation.json" --write-out '%{http_code}' \
+              -H "Authorization: Bearer $LL_TOKEN" \
+              -H 'Content-Type: application/json' \
+              --data "{\"invocation_id\":\"ll-failure-$invocation\",\"tenant_id\":\"test-tenant\",\"deployment_id\":\"stable-generation\",\"payload_json\":{},\"timeout_ms\":2000}" \
+              http://127.0.0.1:8763/v1/invoke)" = 200
+            grep -q '"ok":false' "$RUNNER_TEMP/ll-invoke-$invocation.json"
+            curl --fail --silent http://127.0.0.1:8763/healthz | grep -qx ok
+          done
+
+          curl --fail --silent -H "Authorization: Bearer $WASMX_TOKEN" http://127.0.0.1:8766/v1/status > "$RUNNER_TEMP/wasmx-status.json"
+          curl --fail --silent -H "Authorization: Bearer $LL_TOKEN" http://127.0.0.1:8763/v1/status > "$RUNNER_TEMP/ll-status.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          temp = Path(os.environ["RUNNER_TEMP"])
+          wasmx = json.loads((temp / "wasmx-status.json").read_text())
+          assert wasmx["runtime"] == "wasmtime"
+          assert wasmx["target_triple"] == "wasm32-unknown-unknown"
+          assert wasmx["wasi_enabled"] is False
+          assert wasmx["store_per_invocation"] is True
+          assert wasmx["accepted"] >= 2
+          assert wasmx["completed"] >= 2
+
+          ll = json.loads((temp / "ll-status.json").read_text())
+          assert ll["runtime"] == "lunatic_wasm"
+          assert ll["actor_reusable"] is False
+          assert ll["worker_mode"] == "embedded_fresh_lunatic_actor"
+          assert ll["accepted"] >= 2
+          assert ll["completed"] >= 2
+          assert ll["failed"] >= 2
+          PY
 
           kill "$(cat "$RUNNER_TEMP/wasmx.pid")"
           wait "$(cat "$RUNNER_TEMP/wasmx.pid")" 2>/dev/null || true
